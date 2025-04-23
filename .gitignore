@@ -1,0 +1,7 @@
+# files
+*.pyc
+layout.json
+
+# Exclude .vscode directory except launch.json
+.vscode/*
+!.vscode/launch.json
