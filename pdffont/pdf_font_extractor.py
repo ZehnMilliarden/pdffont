@@ -389,6 +389,55 @@ class PdfFontExtractor:
             except Exception as e:
                 print(f"处理字体信息时出错: {e}")
             
+            # 提取字体度量信息
+            metrics = {}
+            try:
+                if "head" in font:
+                    head_table = font["head"]
+                    metrics["units_per_em"] = head_table.unitsPerEm
+                    metrics["created"] = head_table.created
+                    metrics["modified"] = head_table.modified
+                    metrics["x_min"] = head_table.xMin
+                    metrics["y_min"] = head_table.yMin
+                    metrics["x_max"] = head_table.xMax
+                    metrics["y_max"] = head_table.yMax
+                
+                if "hhea" in font:
+                    hhea_table = font["hhea"]
+                    metrics["ascent"] = hhea_table.ascent
+                    metrics["descent"] = hhea_table.descent
+                    metrics["line_gap"] = hhea_table.lineGap
+                    metrics["advance_width_max"] = hhea_table.advanceWidthMax
+                
+                if "OS/2" in font:
+                    os2_table = font["OS/2"]
+                    metrics["weight_class"] = os2_table.usWeightClass
+                    metrics["width_class"] = os2_table.usWidthClass
+                    metrics["subscript_x_size"] = os2_table.ySubscriptXSize
+                    metrics["subscript_y_size"] = os2_table.ySubscriptYSize
+                    metrics["strikeout_size"] = os2_table.yStrikeoutSize
+                    metrics["strikeout_position"] = os2_table.yStrikeoutPosition
+                    
+                    # 字体类型信息
+                    if hasattr(os2_table, "fsType"):
+                        metrics["embedding_rights"] = os2_table.fsType
+                    
+                    # 字体族信息
+                    if hasattr(os2_table, "panose"):
+                        panose = os2_table.panose
+                        panose_dict = {}
+                        
+                        # 安全地获取Panose属性
+                        for attr in ["bFamilyType", "bSerifStyle", "bWeight", "bProportion", 
+                                      "bContrast", "bStrokeVariation", "bArmStyle", 
+                                      "bLetterform", "bMidline", "bXHeight"]:
+                            if hasattr(panose, attr):
+                                panose_dict[attr.replace('b', '').lower()] = getattr(panose, attr)
+                            
+                        metrics["panose"] = panose_dict
+            except Exception as e:
+                print(f"提取字体度量信息时出错: {e}")
+            
             # 返回字体对象和相关信息
             return {
                 "font_obj": font,
@@ -399,7 +448,8 @@ class PdfFontExtractor:
                 "full_name": full_name or basename,
                 "num_glyphs": len(font.getGlyphOrder()),
                 "tables": list(font.keys()),
-                "supported_chars": supported_chars
+                "supported_chars": supported_chars,
+                "metrics": metrics
             }
         except Exception as e:
             print(f"处理字体时出错: {e}")
@@ -407,6 +457,276 @@ class PdfFontExtractor:
         finally:
             if 'font_stream' in locals():
                 font_stream.close()
+    
+    def extract_font_descriptors(self):
+        """直接从 PDF 文件中提取字体描述符(FontDescriptor)信息
+        
+        返回:
+            字体描述符列表，每个元素是一个字典，包含字体名称和字体描述符信息
+        """
+        if not self.__docs__:
+            raise ValueError("未打开PDF文件")
+            
+        font_descriptors = []
+        processed_xrefs = set()  # 记录已处理的xref
+        
+        # 遍历所有页面
+        for page_index, page in enumerate(self.__docs__):
+            # 获取页面上的所有字体
+            fonts = page.get_fonts(full=True)
+            
+            for font in fonts:
+                xref = font[0]  # 字体引用号
+                font_type = font[1]  # 字体类型
+                font_name = font[3]  # 字体名称
+                
+                # 跳过已处理过的字体
+                if xref in processed_xrefs:
+                    continue
+                
+                processed_xrefs.add(xref)
+                
+                # 初始化字体描述符字典
+                descriptor_info = {
+                    "xref": xref,
+                    "type": font_type,
+                    "name": font_name,
+                    "is_embedded": xref != 0,
+                    "raw_info": {},
+                    "metrics": {}
+                }
+                
+                # 直接从 PDF 文档中提取字体描述符信息
+                try:
+                    # 获取字体对象
+                    if xref == 0:
+                        continue  # 跳过非嵌入字体
+                    
+                    # 获取字体对象
+                    font_obj = self.__docs__.xref_object(xref, compressed=True)
+                    if not font_obj:
+                        continue
+                    
+                    # 存储原始内容
+                    if isinstance(font_obj, str):
+                        descriptor_info["raw_info"]["RawContent"] = font_obj
+                    elif isinstance(font_obj, dict):
+                        for key, value in font_obj.items():
+                            descriptor_info["raw_info"][key] = str(value)
+                    
+                    # 判断是否为Type0字体
+                    is_type0 = False
+                    if isinstance(font_obj, str):
+                        is_type0 = "/Subtype/Type0" in font_obj
+                    elif isinstance(font_obj, dict):
+                        is_type0 = font_obj.get("Subtype") == "Type0"
+                    
+                    # 如果是Type0字体，直接获取DescendantFonts引用
+                    if is_type0:
+                        # 从字符串或字典中提取DescendantFonts引用
+                        descendant_ref = None
+                        
+                        if isinstance(font_obj, str):
+                            # 使用正则表达式提取引用
+                            import re
+                            match = re.search(r"/DescendantFonts\s*\[\s*(\d+)\s+0\s+R\s*\]", font_obj)
+                            if match:
+                                descendant_ref = int(match.group(1))
+                        elif isinstance(font_obj, dict) and "DescendantFonts" in font_obj:
+                            # 从字典中提取引用
+                            descendant_fonts = font_obj["DescendantFonts"]
+                            if isinstance(descendant_fonts, list) and len(descendant_fonts) > 0:
+                                ref_str = str(descendant_fonts[0])
+                                if " 0 R" in ref_str:
+                                    descendant_ref = int(ref_str.split(" ")[0])
+                        
+                        # 如果找到了DescendantFonts引用，获取其内容
+                        if descendant_ref:
+                            print(f"找到DescendantFonts引用: {descendant_ref}")
+                            descendant_obj = self.__docs__.xref_object(descendant_ref, compressed=True)
+                            
+                            # 处理后代字体对象
+                            if descendant_obj:
+                                # 存储后代字体信息
+                                if isinstance(descendant_obj, str):
+                                    descriptor_info["raw_info"]["DescendantFont"] = descendant_obj
+                                elif isinstance(descendant_obj, dict):
+                                    for key, value in descendant_obj.items():
+                                        descriptor_info["raw_info"][f"DescendantFont.{key}"] = str(value)
+                                
+                                # 从后代字体中提取FontDescriptor引用
+                                fd_ref = None
+                                
+                                if isinstance(descendant_obj, str):
+                                    # 使用正则表达式提取引用
+                                    match = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", descendant_obj)
+                                    if match:
+                                        fd_ref = int(match.group(1))
+                                elif isinstance(descendant_obj, dict) and "FontDescriptor" in descendant_obj:
+                                    # 从字典中提取引用
+                                    fd_ref_str = str(descendant_obj["FontDescriptor"])
+                                    if " 0 R" in fd_ref_str:
+                                        fd_ref = int(fd_ref_str.split(" ")[0])
+                                
+                                # 如果找到了FontDescriptor引用，获取其内容
+                                if fd_ref:
+                                    print(f"找到FontDescriptor引用: {fd_ref}")
+                                    fd_obj = self.__docs__.xref_object(fd_ref, compressed=True)
+                                    
+                                    # 处理字体描述符对象
+                                    self._process_font_descriptor(fd_obj, descriptor_info)
+                    
+                    # 如果不是Type0字体，直接在当前字体对象中查找FontDescriptor
+                    else:
+                        fd_ref = None
+                        
+                        if isinstance(font_obj, str):
+                            # 使用正则表达式提取引用
+                            match = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", font_obj)
+                            if match:
+                                fd_ref = int(match.group(1))
+                        elif isinstance(font_obj, dict) and "FontDescriptor" in font_obj:
+                            # 从字典中提取引用
+                            fd_ref_str = str(font_obj["FontDescriptor"])
+                            if " 0 R" in fd_ref_str:
+                                fd_ref = int(fd_ref_str.split(" ")[0])
+                        
+                        # 如果找到了FontDescriptor引用，获取其内容
+                        if fd_ref:
+                            print(f"找到FontDescriptor引用: {fd_ref}")
+                            fd_obj = self.__docs__.xref_object(fd_ref, compressed=True)
+                            
+                            # 处理字体描述符对象
+                            self._process_font_descriptor(fd_obj, descriptor_info)
+                    
+                    # 提取字体名称
+                    if "BaseFont" in descriptor_info["raw_info"]:
+                        descriptor_info["family_name"] = descriptor_info["raw_info"]["BaseFont"]
+                    
+                    # 添加到结果中
+                    font_descriptors.append(descriptor_info)
+                except Exception as e:
+                    print(f"提取字体描述符时出错: {e} (xref: {xref}): {e}")
+        
+        return font_descriptors
+    
+    def _process_font_descriptor(self, fd_obj, descriptor_info):
+        """处理字体描述符对象
+        
+        参数:
+            fd_obj: 字体描述符对象
+            descriptor_info: 字体描述符信息字典
+        """
+        try:
+            # 存储原始内容
+            if isinstance(fd_obj, str):
+                descriptor_info["raw_info"]["FontDescriptor"] = fd_obj
+            elif isinstance(fd_obj, dict):
+                for key, value in fd_obj.items():
+                    descriptor_info["raw_info"][f"FontDescriptor.{key}"] = str(value)
+            
+            # 提取字体度量信息
+            self._extract_metrics_from_string(str(fd_obj), descriptor_info["metrics"])
+        except Exception as e:
+            print(f"处理字体描述符时出错: {e}")
+    
+    def _extract_numeric_value(self, text, key):
+        """从字符串中提取数值
+        
+        参数:
+            text: 要解析的字符串
+            key: 要提取的关键字
+            
+        返回:
+            提取的数值，如果无法提取则返回None
+        """
+        try:
+            # 尝试不同的模式匹配
+            patterns = [
+                f"/{key} (-?\d+(\.\d+)?)",  # 如 /Ascent 800
+                f"/{key}/(-?\d+(\.\d+)?)",  # 如 /Ascent/800
+                f"/{key}\s+(-?\d+(\.\d+)?)",  # 如 /Ascent 800
+                f"{key}\s+(-?\d+(\.\d+)?)"  # 如 Ascent 800
+            ]
+            
+            import re
+            for pattern in patterns:
+                match = re.search(pattern, text)
+                if match:
+                    return float(match.group(1))
+            
+            return None
+        except Exception as e:
+            print(f"提取{key}数值时出错: {e}")
+            return None
+    
+    def _extract_array_value(self, text, key):
+        """从字符串中提取数组值
+        
+        参数:
+            text: 要解析的字符串
+            key: 要提取的关键字
+            
+        返回:
+            提取的数组，如果无法提取则返回None
+        """
+        try:
+            # 尝试不同的模式匹配
+            patterns = [
+                f"/{key}\s*\[([^\]]+)\]",  # 如 /FontBBox [-1000 -300 1000 1000]
+                f"/{key}/\[([^\]]+)\]",  # 如 /FontBBox/[-1000 -300 1000 1000]
+                f"{key}\s*\[([^\]]+)\]"  # 如 FontBBox [-1000 -300 1000 1000]
+            ]
+            
+            import re
+            for pattern in patterns:
+                match = re.search(pattern, text)
+                if match:
+                    # 提取数组内容并转换为数字列表
+                    array_str = match.group(1).strip()
+                    return [float(x) for x in array_str.split() if x.strip()]
+            
+            return None
+        except Exception as e:
+            print(f"提取{key}数组时出错: {e}")
+            return None
+    
+    def _extract_metrics_from_string(self, text, metrics_dict):
+        """从字符串中提取字体度量信息并添加到字典中
+        
+        参数:
+            text: 要解析的字符串
+            metrics_dict: 要填充的度量信息字典
+        """
+        try:
+            # 提取常见的度量信息
+            metrics_keys = {
+                "Ascent": "ascent",
+                "Descent": "descent",
+                "CapHeight": "capheight",
+                "XHeight": "xheight",
+                "ItalicAngle": "italicangle",
+                "StemV": "stemv",
+                "StemH": "stemh",
+                "FontWeight": "fontweight",
+                "Flags": "flags"
+            }
+            
+            # 提取数值类型的度量
+            for key, dict_key in metrics_keys.items():
+                value = self._extract_numeric_value(text, key)
+                if value is not None:
+                    metrics_dict[dict_key] = value
+            
+            # 提取FontBBox数组
+            fontbbox = self._extract_array_value(text, "FontBBox")
+            if fontbbox is not None:
+                metrics_dict["fontbbox"] = fontbbox
+                
+            # 打印提取的度量信息
+            print(f"从字符串中提取的度量信息: {metrics_dict}")
+        except Exception as e:
+            print(f"从字符串中提取度量信息时出错: {e}")
     
     def render_text_with_font(self, buffer, text, size=24, font_color=(0, 0, 0), bg_color=(255, 255, 255)):
         """使用指定字体渲染文本并返回图像
